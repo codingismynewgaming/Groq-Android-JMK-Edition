@@ -363,6 +363,19 @@ class GroqIME : InputMethodService() {
                     apiClient?.transcribe(audioRecorder.outputFile, language, dictionary, model) ?: ""
                 }
                 var text = applyReplacements(rawText)
+                if (text.isNotBlank() && isLlmEnabled()) {
+                    setStatus("Optimizing text...")
+                    val llmPrompt = getLlmPrompt()
+                    val llmModel = getLlmModel()
+                    text = try {
+                        withTimeout(30_000L) {
+                            apiClient?.postProcessText(text, llmPrompt, llmModel) ?: text
+                        }
+                    } catch (_: Exception) {
+                        text
+                    }
+                    text = applyReplacements(text)
+                }
                 if (isChatModeEnabled()) {
                     text = stripTrailingPeriod(text)
                 }
@@ -525,12 +538,43 @@ class GroqIME : InputMethodService() {
         }
     }
 
-    private fun getApiKey(): String? {
+    private fun isLlmEnabled(): Boolean {
         return try {
+            getPrefs()?.getBoolean(SettingsActivity.KEY_LLM_ENABLED, true) ?: true
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun getLlmModel(): String {
+        return try {
+            val model = getPrefs()?.getString(SettingsActivity.KEY_LLM_MODEL, null)
+            if (model.isNullOrBlank() || model !in SettingsActivity.VALID_LLM_MODELS) {
+                SettingsActivity.DEFAULT_LLM_MODEL
+            } else {
+                model
+            }
+        } catch (_: Exception) {
+            SettingsActivity.DEFAULT_LLM_MODEL
+        }
+    }
+
+    private fun getLlmPrompt(): String {
+        return try {
+            val prompt = getPrefs()?.getString(SettingsActivity.KEY_LLM_PROMPT, null)
+            if (prompt.isNullOrBlank()) SettingsActivity.DEFAULT_LLM_PROMPT else prompt
+        } catch (_: Exception) {
+            SettingsActivity.DEFAULT_LLM_PROMPT
+        }
+    }
+
+    private fun getApiKey(): String? {
+        val key = try {
             getPrefs()?.getString(SettingsActivity.KEY_API_KEY, null)
         } catch (_: Exception) {
             null
         }
+        return if (!key.isNullOrBlank()) key else SettingsActivity.DEFAULT_API_KEY
     }
 
     private fun getPrefs() = try {

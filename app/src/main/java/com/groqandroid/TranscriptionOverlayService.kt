@@ -58,7 +58,7 @@ class TranscriptionOverlayService : AccessibilityService() {
         private const val PREFS_NAME = "bubble_prefs"
         private const val KEY_BUBBLE_X = "bubble_x"
         private const val KEY_BUBBLE_Y = "bubble_y"
-        private const val TAP_THRESHOLD_DP = 10
+        private const val TAP_THRESHOLD_DP = 28
         private const val KEEPALIVE_INTERVAL_MS = 30_000L
 
         val LANGUAGE_OPTIONS = listOf(
@@ -101,9 +101,15 @@ class TranscriptionOverlayService : AccessibilityService() {
 
     private var bubbleVisible = false
     private var bubbleEnabled = false // user toggle from settings
+    private var isTouchActive = false
     private var tapThresholdPx = 10f // computed in onServiceConnected
     private var longPressHandler = Handler(Looper.getMainLooper())
     private var longPressRunnable: Runnable? = null
+    private val focusCheckHandler = Handler(Looper.getMainLooper())
+    private val focusCheckRunnable = Runnable {
+        updateBubbleAlpha()
+    }
+
 
     // Keepalive: re-attach bubble if OS removes the view
     private val keepaliveHandler = Handler(Looper.getMainLooper())
@@ -187,7 +193,17 @@ class TranscriptionOverlayService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // No-op — required override for AccessibilityService
+        if (!bubbleEnabled || !bubbleVisible) return
+        when (event?.eventType) {
+            AccessibilityEvent.TYPE_VIEW_FOCUSED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                focusCheckHandler.removeCallbacks(focusCheckRunnable)
+                focusCheckHandler.postDelayed(focusCheckRunnable, 100)
+            }
+        }
     }
 
     override fun onInterrupt() {
@@ -205,6 +221,7 @@ class TranscriptionOverlayService : AccessibilityService() {
 
     override fun onDestroy() {
         try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+        focusCheckHandler.removeCallbacks(focusCheckRunnable)
         keepaliveHandler.removeCallbacks(keepaliveRunnable)
         try { unregisterReceiver(commandReceiver) } catch (_: Exception) {}
         @Suppress("DEPRECATION")
@@ -285,10 +302,14 @@ class TranscriptionOverlayService : AccessibilityService() {
         if (bubbleVisible) return
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        val bubbleSize = (48 * resources.displayMetrics.density).toInt()
+        val bubbleSize = (56 * resources.displayMetrics.density).toInt()
+        val edgeMargin = (16 * resources.displayMetrics.density).toInt()
+        val screenWidth = resources.displayMetrics.widthPixels
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val savedX = prefs.getInt(KEY_BUBBLE_X, 0)
+        val defaultX = screenWidth - bubbleSize - edgeMargin
+        val rawSavedX = prefs.getInt(KEY_BUBBLE_X, defaultX)
+        val savedX = if (rawSavedX <= 0) defaultX else rawSavedX.coerceIn(edgeMargin, (screenWidth - bubbleSize - edgeMargin).coerceAtLeast(edgeMargin))
         val savedY = prefs.getInt(KEY_BUBBLE_Y, resources.displayMetrics.heightPixels / 3)
 
         // MIUI/Xiaomi doesn't deliver touch events for TYPE_ACCESSIBILITY_OVERLAY.
@@ -300,9 +321,9 @@ class TranscriptionOverlayService : AccessibilityService() {
         }
 
         layoutParams = WindowManager.LayoutParams(
-            bubbleSize, bubbleSize,
+            1, 1,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -313,10 +334,11 @@ class TranscriptionOverlayService : AccessibilityService() {
         bubbleView = ImageView(this).apply {
             setImageResource(R.drawable.ic_mic)
             setBackgroundResource(R.drawable.bubble_bg)
-            val pad = (10 * resources.displayMetrics.density).toInt()
+            val pad = (12 * resources.displayMetrics.density).toInt()
             setPadding(pad, pad, pad, pad)
-            elevation = 8 * resources.displayMetrics.density
+            elevation = 12 * resources.displayMetrics.density
             isClickable = true
+            alpha = 0.0f
         }
 
         setupTouchListener()
@@ -324,6 +346,7 @@ class TranscriptionOverlayService : AccessibilityService() {
         try {
             windowManager?.addView(bubbleView, layoutParams)
             bubbleVisible = true
+            focusCheckHandler.postDelayed(focusCheckRunnable, 300)
             // Start as foreground service to prevent Android from killing us
             val notification = buildNotification(bubbleHidden = false)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -378,20 +401,23 @@ class TranscriptionOverlayService : AccessibilityService() {
         view.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    isTouchActive = true
+                    vibrate(20)
                     initialX = params.x
                     initialY = params.y
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
                     isDragging = false
                     isLongPress = false
-                    // Visual press feedback
-                    v.alpha = 0.6f
-                    v.scaleX = 0.9f
-                    v.scaleY = 0.9f
+                    // Full opacity and feedback on press
+                    v.alpha = 1.0f
+                    v.scaleX = 0.92f
+                    v.scaleY = 0.92f
                     // Start long-press timer (only when idle)
                     if (state == State.IDLE) {
                         longPressRunnable = Runnable {
                             isLongPress = true
+                            isTouchActive = true
                             v.alpha = 1.0f
                             v.scaleX = 1.0f
                             v.scaleY = 1.0f
@@ -431,20 +457,25 @@ class TranscriptionOverlayService : AccessibilityService() {
                     v.scaleY = 1.0f
 
                     if (isLongPress) {
-                        // Long press handled — language popup is shown
-                    } else if (!isDragging) {
-                        onBubbleTapped()
+                        // Long press handled — language popup is shown, isTouchActive remains true until popup dismisses
                     } else {
-                        snapToEdge()
+                        isTouchActive = false
+                        if (!isDragging) {
+                            onBubbleTapped()
+                        } else {
+                            snapToEdge()
+                        }
                     }
                     savePosition()
+                    updateBubbleAlpha()
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
-                    v.alpha = 1.0f
+                    isTouchActive = false
                     v.scaleX = 1.0f
                     v.scaleY = 1.0f
+                    updateBubbleAlpha()
                     true
                 }
                 else -> true
@@ -461,6 +492,11 @@ class TranscriptionOverlayService : AccessibilityService() {
             }
             // Add "Verbergen" as last item
             popup.menu.add(0, LANGUAGE_OPTIONS.size, LANGUAGE_OPTIONS.size, "Verbergen")
+
+            popup.setOnDismissListener {
+                isTouchActive = false
+                updateBubbleAlpha()
+            }
 
             popup.setOnMenuItemClickListener { item ->
                 if (item.itemId == LANGUAGE_OPTIONS.size) {
@@ -481,16 +517,20 @@ class TranscriptionOverlayService : AccessibilityService() {
                 true
             }
             popup.show()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            isTouchActive = false
+            updateBubbleAlpha()
+        }
     }
 
     private fun snapToEdge() {
         val params = layoutParams ?: return
         val screenWidth = resources.displayMetrics.widthPixels
-        val bubbleSize = (48 * resources.displayMetrics.density).toInt()
+        val bubbleSize = (56 * resources.displayMetrics.density).toInt()
+        val edgeMargin = (16 * resources.displayMetrics.density).toInt()
         val centerX = params.x + bubbleSize / 2
 
-        params.x = if (centerX < screenWidth / 2) 0 else screenWidth - bubbleSize
+        params.x = if (centerX < screenWidth / 2) edgeMargin else (screenWidth - bubbleSize - edgeMargin).coerceAtLeast(edgeMargin)
 
         try {
             windowManager?.updateViewLayout(bubbleView, params)
@@ -615,6 +655,18 @@ class TranscriptionOverlayService : AccessibilityService() {
                     val model = getWhisperModel()
                     val rawText = apiClient?.transcribe(audioRecorder.outputFile, language, dictionary, model) ?: ""
                     var text = applyReplacements(rawText)
+                    if (text.isNotBlank() && isLlmEnabled()) {
+                        val llmPrompt = getLlmPrompt()
+                        val llmModel = getLlmModel()
+                        text = try {
+                            kotlinx.coroutines.withTimeout(30_000L) {
+                                apiClient?.postProcessText(text, llmPrompt, llmModel) ?: text
+                            }
+                        } catch (_: Exception) {
+                            text
+                        }
+                        text = applyReplacements(text)
+                    }
                     if (isChatModeEnabled()) {
                         text = stripTrailingPeriod(text)
                     }
@@ -643,6 +695,60 @@ class TranscriptionOverlayService : AccessibilityService() {
         }
     }
 
+    private fun checkIfInputFieldFocused(): Boolean {
+        return try {
+            val root = rootInActiveWindow ?: return false
+            val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (focused != null) {
+                val isEditable = focused.isEditable ||
+                    focused.className?.contains("EditText", ignoreCase = true) == true ||
+                    (focused.isFocusable && focused.className?.contains("Edit", ignoreCase = true) == true)
+                @Suppress("DEPRECATION")
+                focused.recycle()
+                @Suppress("DEPRECATION")
+                root.recycle()
+                isEditable
+            } else {
+                @Suppress("DEPRECATION")
+                root.recycle()
+                false
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun updateBubbleAlpha(forceAlpha: Float? = null) {
+        val view = bubbleView ?: return
+        val params = layoutParams ?: return
+
+        val shouldBeActive = forceAlpha != null || state != State.IDLE || isTouchActive || checkIfInputFieldFocused()
+
+        if (shouldBeActive) {
+            val fullSize = (56 * resources.displayMetrics.density).toInt()
+            if (params.width != fullSize || params.height != fullSize || (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0) {
+                params.width = fullSize
+                params.height = fullSize
+                params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                try {
+                    windowManager?.updateViewLayout(view, params)
+                } catch (_: Exception) {}
+            }
+            view.animate().alpha(forceAlpha ?: 1.0f).setDuration(150).start()
+        } else {
+            if (params.width != 1 || params.height != 1 || (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) == 0) {
+                params.width = 1
+                params.height = 1
+                params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                try {
+                    windowManager?.updateViewLayout(view, params)
+                } catch (_: Exception) {}
+            }
+            view.animate().cancel()
+            view.alpha = 0.0f
+        }
+    }
+
     private fun updateBubbleState() {
         val view = bubbleView ?: return
         view.setBackgroundResource(
@@ -652,6 +758,7 @@ class TranscriptionOverlayService : AccessibilityService() {
                 State.PROCESSING -> R.drawable.mic_button_processing
             }
         )
+        updateBubbleAlpha()
     }
 
     // --- Text insertion via accessibility ---
@@ -666,6 +773,18 @@ class TranscriptionOverlayService : AccessibilityService() {
             if (focusedNode == null) {
                 // No focused node found — fallback to clipboard paste
                 pasteViaClipboard(text)
+                return
+            }
+
+            // Notes uses a long editor inside a ScrollView. Replacing all text moves
+            // the cursor to the document end and can scroll before selection is restored.
+            if (focusedNode.packageName?.toString() == "it.niedermann.owncloud.notes") {
+                val pasted = focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                if (!pasted) {
+                    Toast.makeText(this, "Text copied. Paste manually in Notes.", Toast.LENGTH_SHORT).show()
+                }
+                @Suppress("DEPRECATION")
+                focusedNode.recycle()
                 return
             }
 
@@ -723,186 +842,134 @@ class TranscriptionOverlayService : AccessibilityService() {
 
     private fun pasteViaClipboard(text: String) {
         val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        // Set our text (kept on clipboard so user can paste manually if needed)
         clipboard.setPrimaryClip(android.content.ClipData.newPlainText("transcription", text))
-        // Small delay to let clipboard update, then paste
-        Handler(Looper.getMainLooper()).postDelayed({
-            try {
-                val node = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                if (node != null) {
-                    node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                    @Suppress("DEPRECATION")
-                    node.recycle()
-                }
-            } catch (_: Exception) {}
-        }, 100)
-    }
-
-    // --- Audio cues (matches OpenWhispr dictation cues) ---
-
-    private fun playDictationCue(notes: FloatArray) {
-        try {
-            val sampleRate = 44100
-            val noteDuration = 0.09f
-            val noteGap = 0.025f
-            val attackTime = 0.015f
-            val maxGain = 0.2f
-
-            val noteSamples = (noteDuration * sampleRate).toInt()
-            val gapSamples = (noteGap * sampleRate).toInt()
-            val totalSamples = notes.size * noteSamples + (notes.size - 1) * gapSamples
-            val buffer = ShortArray(totalSamples)
-
-            var offset = 0
-            for (freq in notes) {
-                val decayDuration = noteDuration - attackTime
-                for (i in 0 until noteSamples) {
-                    val t = i.toFloat() / sampleRate
-                    val sine = Math.sin(2.0 * Math.PI * freq * t).toFloat()
-                    // Envelope: linear ramp up, then exponential ramp down to 0.0001 (matches OpenWhispr)
-                    val envelope = if (t < attackTime) {
-                        (t / attackTime) * maxGain
-                    } else {
-                        val decayProgress = (t - attackTime) / decayDuration
-                        (maxGain * Math.pow(0.0001 / maxGain.toDouble(), decayProgress.toDouble())).toFloat()
-                    }
-                    buffer[offset + i] = (sine * envelope * Short.MAX_VALUE).toInt().toShort()
-                }
-                offset += noteSamples + gapSamples
-            }
-
-            val audioTrack = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setSampleRate(sampleRate)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(buffer.size * 2)
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .build()
-
-            audioTrack.write(buffer, 0, buffer.size)
-            audioTrack.setNotificationMarkerPosition(buffer.size - 1)
-            val lock = java.util.concurrent.CountDownLatch(1)
-            audioTrack.setPlaybackPositionUpdateListener(object : AudioTrack.OnPlaybackPositionUpdateListener {
-                override fun onMarkerReached(track: AudioTrack?) { lock.countDown() }
-                override fun onPeriodicNotification(track: AudioTrack?) {}
-            })
-            audioTrack.play()
-            lock.await(1000, java.util.concurrent.TimeUnit.MILLISECONDS)
-            audioTrack.release()
-        } catch (_: Exception) {}
-    }
-
-    // --- Settings helpers (same pattern as GroqIME) ---
-
-    private fun getCustomEndpoint(): String? {
-        return try {
-            val endpoint = getEncryptedPrefs().getString(SettingsActivity.KEY_API_ENDPOINT, null)
-            if (endpoint.isNullOrBlank()) null else endpoint
-        } catch (_: Exception) {
-            null
+        val focusedNode = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focusedNode != null) {
+            focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            @Suppress("DEPRECATION")
+            focusedNode.recycle()
         }
     }
 
-    private fun getWhisperModel(): String {
-        return try {
-            getEncryptedPrefs().getString(SettingsActivity.KEY_WHISPER_MODEL, "whisper-large-v3-turbo") ?: "whisper-large-v3-turbo"
-        } catch (_: Exception) {
-            "whisper-large-v3-turbo"
-        }
-    }
+    // --- Audio Cues via AudioTrack ---
 
-    private fun isSoundEnabled(): Boolean {
+    private fun isHapticEnabled(): Boolean {
         return try {
-            getEncryptedPrefs().getBoolean(SettingsActivity.KEY_SOUND_ENABLED, true)
+            val prefs = getEncryptedPrefs()
+            prefs.getBoolean(SettingsActivity.KEY_HAPTIC_ENABLED, true)
         } catch (_: Exception) {
             true
         }
     }
 
-    private fun isHapticEnabled(): Boolean {
+    private fun isSoundEnabled(): Boolean {
         return try {
-            getEncryptedPrefs().getBoolean(SettingsActivity.KEY_HAPTIC_ENABLED, true)
+            val prefs = getEncryptedPrefs()
+            prefs.getBoolean(SettingsActivity.KEY_SOUND_ENABLED, true)
         } catch (_: Exception) {
             true
         }
     }
 
     private fun getApiKey(): String? {
-        return try {
-            getEncryptedPrefs().getString(SettingsActivity.KEY_API_KEY, null)
-        } catch (_: Exception) {
-            null
-        }
+        val prefs = getEncryptedPrefs()
+        return prefs.getString(SettingsActivity.KEY_API_KEY, null)
+    }
+
+    private fun getCustomEndpoint(): String? {
+        val prefs = getEncryptedPrefs()
+        val url = prefs.getString(SettingsActivity.KEY_API_ENDPOINT, null)
+        return if (!url.isNullOrBlank()) url.trim() else null
     }
 
     private fun getLanguage(): String? {
-        return try {
-            getEncryptedPrefs().getString(SettingsActivity.KEY_LANGUAGE, null)
-        } catch (_: Exception) {
-            null
-        }
+        val prefs = getEncryptedPrefs()
+        return prefs.getString(SettingsActivity.KEY_LANGUAGE, null)
     }
 
     private fun getDictionary(): String? {
+        val prefs = getEncryptedPrefs()
+        val jsonStr = prefs.getString(SettingsActivity.KEY_DICTIONARY, null) ?: return null
         return try {
-            val dict = getEncryptedPrefs().getString(SettingsActivity.KEY_DICTIONARY, null)
-            if (dict.isNullOrBlank()) return null
-            val words = dict.split(",").filter { it.isNotBlank() }.take(200).joinToString(", ") { it.trim() }
-            if (words.isEmpty()) null else "Vocabulary: $words."
+            val jsonArray = JSONArray(jsonStr)
+            val list = mutableListOf<String>()
+            for (i in 0 until jsonArray.length()) {
+                val word = jsonArray.getString(i)
+                if (word.isNotBlank()) list.add(word.trim())
+            }
+            if (list.isNotEmpty()) list.joinToString(", ") else null
         } catch (_: Exception) {
             null
         }
     }
 
-    private fun getReplacements(): List<Pair<String, String>> {
+    private fun getWhisperModel(): String {
+        val prefs = getEncryptedPrefs()
+        return prefs.getString(SettingsActivity.KEY_WHISPER_MODEL, "whisper-large-v3") ?: "whisper-large-v3"
+    }
+
+    private fun isLlmEnabled(): Boolean {
         return try {
-            val json = getEncryptedPrefs().getString(SettingsActivity.KEY_REPLACEMENTS, "[]") ?: "[]"
-            val arr = JSONArray(json)
-            (0 until arr.length()).map { i ->
-                val obj = arr.getJSONObject(i)
-                obj.getString("from") to obj.getString("to")
-            }
+            getEncryptedPrefs().getBoolean(SettingsActivity.KEY_LLM_ENABLED, true)
         } catch (_: Exception) {
-            emptyList()
+            true
         }
     }
 
-    private fun applyReplacements(text: String): String {
-        var result = text
-        for ((from, to) in getReplacements()) {
-            val escaped = Regex.escape(from)
-            val prefix = if (from.first().isLetterOrDigit() || from.first() == '_') "\\b" else ""
-            val suffix = if (from.last().isLetterOrDigit() || from.last() == '_') "\\b" else ""
-            val pattern = Regex("$prefix$escaped$suffix", RegexOption.IGNORE_CASE)
-            result = pattern.replace(result, Regex.escapeReplacement(to))
+    private fun getLlmModel(): String {
+        return try {
+            val model = getEncryptedPrefs().getString(SettingsActivity.KEY_LLM_MODEL, null)
+            if (model.isNullOrBlank() || model !in SettingsActivity.VALID_LLM_MODELS) {
+                SettingsActivity.DEFAULT_LLM_MODEL
+            } else {
+                model
+            }
+        } catch (_: Exception) {
+            SettingsActivity.DEFAULT_LLM_MODEL
         }
-        return result
+    }
+
+    private fun getLlmPrompt(): String {
+        return try {
+            val prompt = getEncryptedPrefs().getString(SettingsActivity.KEY_LLM_PROMPT, null)
+            if (prompt.isNullOrBlank()) SettingsActivity.DEFAULT_LLM_PROMPT else prompt
+        } catch (_: Exception) {
+            SettingsActivity.DEFAULT_LLM_PROMPT
+        }
     }
 
     private fun isChatModeEnabled(): Boolean {
+        val prefs = getEncryptedPrefs()
+        return prefs.getBoolean(SettingsActivity.KEY_CHAT_MODE, false)
+    }
+
+    private fun applyReplacements(text: String): String {
+        val prefs = getEncryptedPrefs()
+        val jsonStr = prefs.getString(SettingsActivity.KEY_REPLACEMENTS, null) ?: return text
         return try {
-            getEncryptedPrefs().getBoolean(SettingsActivity.KEY_CHAT_MODE, false)
+            val jsonArray = JSONArray(jsonStr)
+            var modified = text
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                val target = obj.getString("target")
+                val replacement = obj.getString("replacement")
+                if (target.isNotBlank()) {
+                    modified = modified.replace(target, replacement, ignoreCase = true)
+                }
+            }
+            modified
         } catch (_: Exception) {
-            false
+            text
         }
     }
 
     private fun stripTrailingPeriod(text: String): String {
         val trimmed = text.trimEnd()
-        if (trimmed.endsWith(".") && !trimmed.endsWith("..")) {
-            return trimmed.dropLast(1)
+        return if (trimmed.endsWith('.')) {
+            trimmed.substring(0, trimmed.length - 1)
+        } else {
+            trimmed
         }
-        return text
     }
 
     private fun getEncryptedPrefs() = EncryptedSharedPreferences.create(
@@ -912,4 +979,54 @@ class TranscriptionOverlayService : AccessibilityService() {
         EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
     )
+
+    private fun playDictationCue(frequencies: FloatArray) {
+        try {
+            val sampleRate = 16000
+            val durationMs = 80
+            val numSamples = (sampleRate * durationMs) / 1000
+            val buffer = ByteArray(numSamples * 2)
+            val rampSamples = sampleRate * 10 / 1000 // 10ms ramp for click-free audio
+
+            for (freq in frequencies) {
+                for (i in 0 until numSamples) {
+                    val time = i.toDouble() / sampleRate
+                    var envelope = 1.0
+                    if (i < rampSamples) {
+                        envelope = i.toDouble() / rampSamples
+                    } else if (i > numSamples - rampSamples) {
+                        envelope = (numSamples - i).toDouble() / rampSamples
+                    }
+                    val sample = kotlin.math.sin(2.0 * Math.PI * freq * time) * 32767.0 * 0.15 * envelope
+                    val sInt = sample.toInt().toShort()
+                    buffer[i * 2] = (sInt.toInt() and 0xff).toByte()
+                    buffer[i * 2 + 1] = (sInt.toInt() ushr 8 and 0xff).toByte()
+                }
+            }
+
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(buffer.size)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+
+            track.write(buffer, 0, buffer.size)
+            track.play()
+            Thread.sleep((durationMs * frequencies.size + 20).toLong())
+            track.stop()
+            track.release()
+        } catch (_: Exception) {}
+    }
 }

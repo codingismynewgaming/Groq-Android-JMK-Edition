@@ -19,6 +19,13 @@
 
 ---
 
+## Lokaler Projektstand
+
+- [Projektübersicht und Befehle](projektinfo.md)
+- [Aktueller Stand](status.md)
+- [Bubble- und Setup-Dokumentation](docs/DOKUMENTATION_BUBBLE_FIX.md)
+- [Erfahrungen](docs/tasks/lessons.md)
+
 ## Features
 
 ### Speech-to-Text Keyboard
